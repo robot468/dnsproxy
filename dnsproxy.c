@@ -741,6 +741,33 @@ void shrink_hash_table(struct hash_table *ht) {
     }
 }
 
+// Сжатие кэша IP при малом количестве элементов
+void shrink_ip_cache(struct ip_cache *cache) {
+    if (!cache || cache->size <= INITIAL_IP_CACHE_SIZE) return;
+
+    // Если элементов меньше 25% от размера таблицы, уменьшаем размер
+    if ((float)cache->count / cache->size < 0.25) {
+        size_t new_size = cache->size / 2;
+        struct cached_ip **new_buckets = calloc(new_size, sizeof(struct cached_ip *));
+        if (!new_buckets) return;
+
+        for (size_t i = 0; i < cache->size; i++) {
+            struct cached_ip *entry = cache->buckets[i];
+            while (entry) {
+                struct cached_ip *next = entry->next;
+                size_t new_index = hash_subnet(entry->subnet, new_size);
+                entry->next = new_buckets[new_index];
+                new_buckets[new_index] = entry;
+                entry = next;
+            }
+        }
+
+        free(cache->buckets);
+        cache->buckets = new_buckets;
+        cache->size = new_size;
+    }
+}
+
 void free_domain_node(struct domain_node *node) {
     if (!node) return;
     
@@ -787,8 +814,8 @@ void cleanup_ip_cache() {
     
     if (removed > 0) {
         syslog(LOG_INFO, "Cleaned up %zu expired IP cache entries", removed);
-        // Сжимаем хэш-таблицу после удаления элементов
-        shrink_hash_table((struct hash_table *)ip_cache);
+        // Сжимаем кэш IP после удаления элементов
+        shrink_ip_cache(ip_cache);
     }
 }
 
