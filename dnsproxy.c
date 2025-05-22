@@ -29,6 +29,7 @@
 // Constants
 #define MAX_CACHED_IPS 65536
 #define MAX_BLOCKLIST_FILES 10
+#define MAX_GATEWAYS 10
 #define MAX_DOMAIN_PARTS 32
 #define MAX_DOMAIN_LENGTH 256
 #define MAX_LABEL_LENGTH 64  // RFC 1035: максимальная длина метки 63 байта + 1 для нулевого символа
@@ -46,7 +47,8 @@ struct ip_cache;     // Forward declaration
 // Complete structure definitions
 struct domain_node {
     struct hash_table *children;
-    int is_terminal;
+    int exact;
+    int wildcard;
 };
 
 struct hash_table {
@@ -106,18 +108,23 @@ void free_string_pool(struct string_pool *pool);
 
 // Global variables
 struct ip_cache *ip_cache = NULL;
-struct domain_node *domain_root = NULL;
 struct string_pool *global_string_pool = NULL;
 
 // Configuration structure
+struct gateway_config {
+    char gateway[64];
+    char blocked_domains_file[MAX_BLOCKLIST_FILES][256];
+    int blocked_domains_file_count;
+    struct domain_node *domain_root;
+};
+
 struct config {
     char listen_address[64];
     int listen_port;
     char upstream_dns[64];
-    char gateway[64];
     int route_expire;
-    char blocked_domains_file[MAX_BLOCKLIST_FILES][256];
-    int blocked_domains_file_count;
+    struct gateway_config gateways[MAX_GATEWAYS];
+    int gateway_count;
 } cfg;
 
 struct event_base *evbase;
@@ -330,12 +337,13 @@ struct domain_node *create_node() {
     
     node->children->size = INITIAL_HASH_SIZE;
     node->children->count = 0;
-    node->is_terminal = 0;
+    node->exact = 0;
+    node->wildcard = 0;
     
     return node;
 }
 
-void add_domain_to_tree(const char *domain) {
+void add_domain_to_tree(struct domain_node **root, const char *domain, int wildcard) {
     char parts[MAX_DOMAIN_PARTS][MAX_LABEL_LENGTH];
     int count;
     
@@ -348,9 +356,9 @@ void add_domain_to_tree(const char *domain) {
         }
     }
     
-    if (!domain_root) {
-        domain_root = create_node();
-        if (!domain_root) return;
+    if (!*root) {
+        *root = create_node();
+        if (!*root) return;
     }
     
     // Проверяем длину домена
@@ -369,7 +377,7 @@ void add_domain_to_tree(const char *domain) {
         return;
     }
     
-    struct domain_node *current = domain_root;
+    struct domain_node *current = *root;
     for (int i = 0; i < count; i++) {
         uint32_t hash = hash_string_fnv(parts[i]);
         struct hash_entry *entry = find_entry(current->children, parts[i], hash);
@@ -409,15 +417,18 @@ void add_domain_to_tree(const char *domain) {
         current = entry->node;
     }
     
-    current->is_terminal = 1;
+    if (wildcard)
+        current->wildcard = 1;
+    else
+        current->exact = 1;
 }
 
 // Проверяет, содержится ли домен в дереве
-int domain_in_tree(const char *domain) {
+int domain_in_tree(struct domain_node *root, const char *domain) {
     char parts[MAX_DOMAIN_PARTS][MAX_LABEL_LENGTH];
     int count;
     
-    if (!domain_root) return 0;
+    if (!root) return 0;
     
     // Проверяем длину домена
     size_t domain_len = strlen(domain);
@@ -436,15 +447,15 @@ int domain_in_tree(const char *domain) {
     }
     
     // Ищем в дереве, начиная с конца (TLD)
-    struct domain_node *current = domain_root;
+    struct domain_node *current = root;
     for (int i = 0; i < count && current; i++) {
-        if (current->is_terminal) return 1;  // Нашли родительский домен
+        if (current->wildcard) return 1;  // Нашли родительский домен
         
         struct hash_entry *entry = find_entry(current->children, parts[i], hash_string_fnv(parts[i]));
         current = entry ? entry->node : NULL;
     }
-    
-    return current && current->is_terminal;
+
+    return current && (current->exact || current->wildcard);
 }
 
 // Разбивает домен на части в обратном порядке
@@ -499,9 +510,9 @@ void load_config() {
         syslog(LOG_ERR, "Unable to open config file");
         exit(1);
     }
-    
-    // Инициализируем счетчик файлов
-    cfg.blocked_domains_file_count = 0;
+
+    cfg.gateway_count = 0;
+    struct gateway_config *current_gw = NULL;
     
     char line[512];
     while (fgets(line, sizeof(line), f)) {
@@ -510,34 +521,60 @@ void load_config() {
         *eq = '\0';
         char *k = line, *v = eq + 1;
         trim(k); trim(v);
-        if (!strcmp(k, "listen_address")) strncpy(cfg.listen_address, v, sizeof(cfg.listen_address));
-        else if (!strcmp(k, "listen_port")) cfg.listen_port = atoi(v);
-        else if (!strcmp(k, "upstream_dns")) strncpy(cfg.upstream_dns, v, sizeof(cfg.upstream_dns));
-        else if (!strcmp(k, "gateway")) strncpy(cfg.gateway, v, sizeof(cfg.gateway));
-        else if (!strcmp(k, "route_expire")) cfg.route_expire = atoi(v);
-        else if (!strcmp(k, "blocked_domains_file")) {
-            if (cfg.blocked_domains_file_count < MAX_BLOCKLIST_FILES) {
-                strncpy(cfg.blocked_domains_file[cfg.blocked_domains_file_count], v, 255);
-                cfg.blocked_domains_file_count++;
+        if (!strcmp(k, "listen_address")) {
+            strncpy(cfg.listen_address, v, sizeof(cfg.listen_address));
+        } else if (!strcmp(k, "listen_port")) {
+            cfg.listen_port = atoi(v);
+        } else if (!strcmp(k, "upstream_dns")) {
+            strncpy(cfg.upstream_dns, v, sizeof(cfg.upstream_dns));
+        } else if (!strcmp(k, "route_expire")) {
+            cfg.route_expire = atoi(v);
+        } else if (!strcmp(k, "gateway")) {
+            if (cfg.gateway_count < MAX_GATEWAYS) {
+                current_gw = &cfg.gateways[cfg.gateway_count++];
+                strncpy(current_gw->gateway, v, sizeof(current_gw->gateway));
+                current_gw->blocked_domains_file_count = 0;
+                current_gw->domain_root = NULL;
             } else {
-                syslog(LOG_WARNING, "Maximum number of blocklist files (%d) exceeded, ignoring %s", 
-                       MAX_BLOCKLIST_FILES, v);
+                syslog(LOG_WARNING, "Maximum number of gateways (%d) exceeded, ignoring %s",
+                       MAX_GATEWAYS, v);
+                current_gw = NULL;
+            }
+        } else if (!strcmp(k, "blocked_domains_file")) {
+            if (!current_gw) {
+                syslog(LOG_WARNING, "blocked_domains_file specified before any gateway, ignoring %s", v);
+            } else if (current_gw->blocked_domains_file_count < MAX_BLOCKLIST_FILES) {
+                strncpy(current_gw->blocked_domains_file[current_gw->blocked_domains_file_count], v, 255);
+                current_gw->blocked_domains_file_count++;
+            } else {
+                syslog(LOG_WARNING,
+                       "Maximum number of blocklist files (%d) exceeded for gateway %s, ignoring %s",
+                       MAX_BLOCKLIST_FILES, current_gw->gateway, v);
             }
         }
     }
     fclose(f);
-    
-    if (cfg.blocked_domains_file_count == 0) {
-        syslog(LOG_WARNING, "No blocklist files specified in config");
+
+    if (cfg.gateway_count == 0) {
+        syslog(LOG_WARNING, "No gateways specified in config");
+    } else {
+        for (int i = 0; i < cfg.gateway_count; i++) {
+            if (cfg.gateways[i].blocked_domains_file_count == 0) {
+                syslog(LOG_WARNING, "Gateway %s has no blocklist files", cfg.gateways[i].gateway);
+            }
+        }
     }
 }
 
 // Функция загрузки блоклиста теперь обычная:
 void load_blocklist() {
     syslog(LOG_INFO, "Loading blocklist");
-    if (domain_root) {
-        free_domain_node(domain_root);
-        domain_root = NULL;
+
+    for (int i = 0; i < cfg.gateway_count; i++) {
+        if (cfg.gateways[i].domain_root) {
+            free_domain_node(cfg.gateways[i].domain_root);
+            cfg.gateways[i].domain_root = NULL;
+        }
     }
     if (global_string_pool) {
         free_string_pool(global_string_pool);
@@ -549,38 +586,42 @@ void load_blocklist() {
     gettimeofday(&start_time, NULL);
     gettimeofday(&last_progress_time, NULL);
 
-    for (int file_idx = 0; file_idx < cfg.blocked_domains_file_count; file_idx++) {
-        FILE *f = fopen(cfg.blocked_domains_file[file_idx], "r");
-        if (!f) {
-            syslog(LOG_ERR, "Unable to open blocklist file: %s", cfg.blocked_domains_file[file_idx]);
-            continue;
-        }
+    for (int gw = 0; gw < cfg.gateway_count; gw++) {
+        for (int file_idx = 0; file_idx < cfg.gateways[gw].blocked_domains_file_count; file_idx++) {
+            FILE *f = fopen(cfg.gateways[gw].blocked_domains_file[file_idx], "r");
+            if (!f) {
+                syslog(LOG_ERR, "Unable to open blocklist file: %s", cfg.gateways[gw].blocked_domains_file[file_idx]);
+                continue;
+            }
 
-        char line[MAX_DOMAIN_LENGTH];
-        int file_domains = 0;
-        while (fgets(line, sizeof(line), f)) {
-            trim(line);
-            if (!*line) continue;
-            add_domain_to_tree(line);
-            file_domains++;
-            total_domains++;
+            char line[MAX_DOMAIN_LENGTH];
+            int file_domains = 0;
+            while (fgets(line, sizeof(line), f)) {
+                trim(line);
+                if (!*line) continue;
+                int wildcard = (line[0] == '.');
+                add_domain_to_tree(&cfg.gateways[gw].domain_root, line, wildcard);
+                file_domains++;
+                total_domains++;
 
-            if (total_domains % 10000 == 0) {
-                gettimeofday(&current_time, NULL);
-                double elapsed = (current_time.tv_sec - start_time.tv_sec) +
-                                 (current_time.tv_usec - start_time.tv_usec) / 1000000.0;
-                double time_since_last = (current_time.tv_sec - last_progress_time.tv_sec) +
-                                        (current_time.tv_usec - last_progress_time.tv_usec) / 1000000.0;
-                
-                if (time_since_last >= 30.0) {  // Выводим сообщение не чаще чем раз в 30 секунд
-                    syslog(LOG_INFO, "Loading domains progress: %d domains in %.1f seconds",
-                           total_domains, elapsed);
-                    last_progress_time = current_time;
+                if (total_domains % 10000 == 0) {
+                    gettimeofday(&current_time, NULL);
+                    double elapsed = (current_time.tv_sec - start_time.tv_sec) +
+                                     (current_time.tv_usec - start_time.tv_usec) / 1000000.0;
+                    double time_since_last = (current_time.tv_sec - last_progress_time.tv_sec) +
+                                            (current_time.tv_usec - last_progress_time.tv_usec) / 1000000.0;
+
+                    if (time_since_last >= 30.0) {
+                        syslog(LOG_INFO, "Loading domains progress: %d domains in %.1f seconds",
+                               total_domains, elapsed);
+                        last_progress_time = current_time;
+                    }
                 }
             }
+            fclose(f);
+            syslog(LOG_INFO, "Loaded %d domains from %s for gateway %s", file_domains,
+                   cfg.gateways[gw].blocked_domains_file[file_idx], cfg.gateways[gw].gateway);
         }
-        fclose(f);
-        syslog(LOG_INFO, "Loaded %d domains from %s", file_domains, cfg.blocked_domains_file[file_idx]);
     }
 
     gettimeofday(&current_time, NULL);
@@ -602,9 +643,15 @@ void load_blocklist() {
     }
 }
 
-// domain_matches теперь просто вызывает domain_in_tree
-int domain_matches(const char *query) {
-    return domain_in_tree(query);
+// Проверяет домен во всех деревьях и возвращает соответствующий шлюз
+int domain_matches(const char *query, struct gateway_config **match_gw) {
+    for (int i = 0; i < cfg.gateway_count; i++) {
+        if (domain_in_tree(cfg.gateways[i].domain_root, query)) {
+            if (match_gw) *match_gw = &cfg.gateways[i];
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // Обработчик SIGHUP
@@ -845,7 +892,7 @@ void free_ip_cache() {
     ip_cache = NULL;
 }
 
-void add_route_via_pfroute(uint32_t ip, const char *domain) {
+void add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
     uint32_t subnet = get_subnet_24(ip);
     
     // Проверяем кэш перед любыми операциями с сокетом
@@ -933,9 +980,9 @@ void add_route_via_pfroute(uint32_t ip, const char *domain) {
             struct in_addr addr;
             addr.s_addr = subnet;
 
-            if (strcmp(gwbuf, cfg.gateway) == 0) {
+            if (strcmp(gwbuf, gateway) == 0) {
                 // Маршрут уже существует через наш шлюз
-                syslog(LOG_DEBUG, "Route for %s/24 (domain: %s) already exists via our gateway", 
+                syslog(LOG_DEBUG, "Route for %s/24 (domain: %s) already exists via our gateway",
                        inet_ntoa(addr), domain);
                 time_t now = time(NULL);
                 time_t expire = now + cfg.route_expire; // Use configured expiration time
@@ -985,7 +1032,7 @@ add_route:
 
     msg.gw.sin_len = sizeof(struct sockaddr_in);
     msg.gw.sin_family = AF_INET;
-    inet_pton(AF_INET, cfg.gateway, &msg.gw.sin_addr);
+    inet_pton(AF_INET, gateway, &msg.gw.sin_addr);
 
     msg.netmask.sin_len = sizeof(struct sockaddr_in);
     msg.netmask.sin_family = AF_INET;
@@ -1005,8 +1052,8 @@ add_route:
         } while (n > 0 && rtm->rtm_seq != msg.hdr.rtm_seq);  // Ждем наше сообщение
 
         if (n > 0 && rtm->rtm_errno == 0) {
-            syslog(LOG_INFO, "Route added for %s/24 (domain: %s) via %s", 
-                   inet_ntoa(addr), domain, cfg.gateway);
+            syslog(LOG_INFO, "Route added for %s/24 (domain: %s) via %s",
+                   inet_ntoa(addr), domain, gateway);
             time_t expire = time(NULL) + cfg.route_expire;
             if (rtm->rtm_rmx.rmx_expire > 0) {
                 expire = rtm->rtm_rmx.rmx_expire;
@@ -1074,7 +1121,8 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
     char qname[256] = {0};
     parse_dns_query(buf, len, qname);
 
-    int match = domain_matches(qname);
+    struct gateway_config *gw = NULL;
+    int match = domain_matches(qname, &gw);
 
     // Проксируем всегда
     int up = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1125,7 +1173,7 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
                     // Используем любой IP из этой подсети
                     for (int j = 0; j < n; ++j) {
                         if (get_subnet_24(ips[j]) == subnets[i]) {
-                            add_route_via_pfroute(ips[j], qname);
+                            add_route_via_pfroute(ips[j], qname, gw->gateway);
                             break;
                         }
                     }
