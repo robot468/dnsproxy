@@ -1,0 +1,27 @@
+#!/bin/sh
+
+# PROVIDE: dnsproxy
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="dnsproxy"
+rcvar=dnsproxy_enable
+
+load_rc_config $name
+
+: ${dnsproxy_enable:="NO"}
+: ${dnsproxy_flags:=""}
+: ${dnsproxy_config:="/usr/local/etc/dnsproxy.conf"}
+: ${dnsproxy_pidfile:="/var/run/${name}.pid"}
+
+pidfile="${dnsproxy_pidfile}"
+procname="/usr/local/sbin/${name}"
+command="/usr/sbin/daemon"
+command_args="-f -p ${pidfile} ${procname} ${dnsproxy_flags}"
+
+extra_commands="reload"
+reload_cmd="${sig_reload}"
+
+run_rc_command "$1"
