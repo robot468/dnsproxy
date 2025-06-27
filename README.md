@@ -24,3 +24,10 @@ blocked_domains_file = /usr/local/etc/blocklist_other.txt
 
 Если домен в списке начинается с точки, блокируются также поддомены. Без точки
 соответствие только точное.
+
+## remove_temp_routes.sh
+
+Скрипт `remove_temp_routes.sh` удаляет временные маршруты, у которых задано
+время истечения (expires). Использует `netstat` и `route` из базовой системы
+FreeBSD, требуются привилегии root.
+
