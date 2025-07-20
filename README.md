@@ -1,6 +1,6 @@
 # dnsproxy
 
-пока freebsd only
+Поддерживаются FreeBSD и Linux (нужен libevent). Перед сборкой запустите `./configure`, который сгенерирует подходящий Makefile.
 
 Dns proxy for domain based routing
 

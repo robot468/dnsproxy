@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+OS=`uname -s`
+CFLAGS="-Wall -O2 -D_GNU_SOURCE"
+LDFLAGS="-levent -pthread"
+if [ "$OS" = "Linux" ]; then
+    : # defaults are fine
+else
+    CFLAGS="$CFLAGS -I/usr/local/include -I/usr/local/include/event2"
+    LDFLAGS="-L/usr/local/lib $LDFLAGS"
+fi
+sed -e "s|@CFLAGS@|$CFLAGS|" -e "s|@LDFLAGS@|$LDFLAGS|" Makefile.in > Makefile
+chmod +x Makefile
+echo "Configured for $OS"
