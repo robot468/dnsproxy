@@ -15,14 +15,18 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#ifdef __linux__
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#else
 #include <net/route.h>
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <netinet/ip.h>
-#include <netinet/in.h>
 #include <netinet/ip_var.h>
 #include <net/if_types.h>
 #include <sys/uio.h>
+#endif
 #include <event2/event.h>
 #include <sys/queue.h>
 
@@ -892,6 +896,67 @@ void free_ip_cache() {
     ip_cache = NULL;
 }
 
+#ifdef __linux__
+void add_route_via_netlink(uint32_t ip, const char *domain, const char *gateway) {
+    uint32_t subnet = get_subnet_24(ip);
+
+    if (is_ip_cached(subnet)) {
+        return;
+    }
+
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (sock < 0) {
+        syslog(LOG_ERR, "NETLINK socket failed: %s", strerror(errno));
+        return;
+    }
+
+    struct {
+        struct nlmsghdr nl;
+        struct rtmsg rt;
+        char buf[256];
+    } req;
+
+    memset(&req, 0, sizeof(req));
+    req.nl.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.nl.nlmsg_type = RTM_NEWROUTE;
+    req.nl.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE;
+    req.nl.nlmsg_seq = time(NULL);
+    req.rt.rtm_family = AF_INET;
+    req.rt.rtm_table = RT_TABLE_MAIN;
+    req.rt.rtm_protocol = RTPROT_STATIC;
+    req.rt.rtm_scope = RT_SCOPE_UNIVERSE;
+    req.rt.rtm_type = RTN_UNICAST;
+    req.rt.rtm_dst_len = 24;
+
+    struct rtattr *rta = (struct rtattr *)((char *)&req + req.nl.nlmsg_len);
+    rta->rta_type = RTA_DST;
+    rta->rta_len = RTA_LENGTH(4);
+    memcpy(RTA_DATA(rta), &subnet, 4);
+    req.nl.nlmsg_len = NLMSG_ALIGN(req.nl.nlmsg_len) + RTA_LENGTH(4);
+
+    struct in_addr gw;
+    inet_pton(AF_INET, gateway, &gw);
+    rta = (struct rtattr *)((char *)&req + req.nl.nlmsg_len);
+    rta->rta_type = RTA_GATEWAY;
+    rta->rta_len = RTA_LENGTH(4);
+    memcpy(RTA_DATA(rta), &gw, 4);
+    req.nl.nlmsg_len = NLMSG_ALIGN(req.nl.nlmsg_len) + RTA_LENGTH(4);
+
+    if (send(sock, &req, req.nl.nlmsg_len, 0) < 0) {
+        struct in_addr addr; addr.s_addr = subnet;
+        syslog(LOG_WARNING, "Failed to add route for %s/24 (domain: %s): %s",
+               inet_ntoa(addr), domain, strerror(errno));
+        close(sock);
+        return;
+    }
+
+    struct in_addr addr; addr.s_addr = subnet;
+    syslog(LOG_INFO, "Route added for %s/24 (domain: %s) via %s",
+           inet_ntoa(addr), domain, gateway);
+    add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire);
+    close(sock);
+}
+#else
 void add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
     uint32_t subnet = get_subnet_24(ip);
     
@@ -1068,6 +1133,7 @@ add_route:
     close(rtsock);
 }
 
+#endif
 
 int parse_dns_query(char *packet, ssize_t len, char *qname) {
     if (len < 12) return 0;
@@ -1173,7 +1239,11 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
                     // Используем любой IP из этой подсети
                     for (int j = 0; j < n; ++j) {
                         if (get_subnet_24(ips[j]) == subnets[i]) {
+#ifdef __linux__
+                            add_route_via_netlink(ips[j], qname, gw->gateway);
+#else
                             add_route_via_pfroute(ips[j], qname, gw->gateway);
+#endif
                             break;
                         }
                     }
