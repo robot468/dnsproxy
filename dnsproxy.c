@@ -123,6 +123,7 @@ struct config {
     int listen_port;
     char upstream_dns[64];
     int route_expire;
+    int log_level;
     struct gateway_config gateways[MAX_GATEWAYS];
     int gateway_count;
 } cfg;
@@ -512,6 +513,7 @@ void load_config() {
     }
 
     cfg.gateway_count = 0;
+    cfg.log_level = LOG_INFO;
     struct gateway_config *current_gw = NULL;
     
     char line[512];
@@ -529,6 +531,8 @@ void load_config() {
             strncpy(cfg.upstream_dns, v, sizeof(cfg.upstream_dns));
         } else if (!strcmp(k, "route_expire")) {
             cfg.route_expire = atoi(v);
+        } else if (!strcmp(k, "log_level")) {
+            cfg.log_level = atoi(v);
         } else if (!strcmp(k, "gateway")) {
             if (cfg.gateway_count < MAX_GATEWAYS) {
                 current_gw = &cfg.gateways[cfg.gateway_count++];
@@ -564,6 +568,8 @@ void load_config() {
             }
         }
     }
+
+    setlogmask(LOG_UPTO(cfg.log_level));
 }
 
 // Функция загрузки блоклиста теперь обычная:
@@ -892,18 +898,19 @@ void free_ip_cache() {
     ip_cache = NULL;
 }
 
-void add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
+int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
     uint32_t subnet = get_subnet_24(ip);
-    
+    int result = 0;
+
     // Проверяем кэш перед любыми операциями с сокетом
     if (is_ip_cached(subnet)) {
-        return;
+        return 0;
     }
 
     int rtsock = socket(PF_ROUTE, SOCK_RAW, 0);
     if (rtsock < 0) {
         syslog(LOG_ERR, "PF_ROUTE socket failed: %s", strerror(errno));
-        return;
+        return -1;
     }
 
     // Используем текущее время в микросекундах для уникального seq
@@ -991,15 +998,15 @@ void add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway)
                 }
                 add_ip_cache_with_expire(subnet, expire);
                 close(rtsock);
-                return;
+                return 0;
             }
             
             if (rtm->rtm_flags & RTF_STATIC) {
                 // Существует статический маршрут через другой шлюз
-                syslog(LOG_WARNING, "Route for %s/24 (domain: %s) exists via different gateway: %s", 
+                syslog(LOG_WARNING, "Route for %s/24 (domain: %s) exists via different gateway: %s",
                        inet_ntoa(addr), domain, gwbuf);
                 close(rtsock);
-                return;
+                return -1;
             }
         }
     }
@@ -1042,8 +1049,9 @@ add_route:
     addr.s_addr = subnet;
 
     if (write(rtsock, &msg, sizeof(msg)) < 0) {
-        syslog(LOG_WARNING, "Failed to add route for %s/24 (domain: %s): %s", 
+        syslog(LOG_WARNING, "Failed to add route for %s/24 (domain: %s): %s",
                inet_ntoa(addr), domain, strerror(errno));
+        result = -1;
     } else {
         // Ждем подтверждения добавления маршрута
         do {
@@ -1062,10 +1070,12 @@ add_route:
         } else {
             syslog(LOG_WARNING, "Route add confirmation failed for %s/24 (domain: %s): %s",
                    inet_ntoa(addr), domain, rtm->rtm_errno ? strerror(rtm->rtm_errno) : "No response");
+            result = -1;
         }
     }
 
     close(rtsock);
+    return result;
 }
 
 
@@ -1145,6 +1155,7 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
 
     struct gateway_config *gw = NULL;
     int match = domain_matches(qname, &gw);
+    syslog(LOG_DEBUG, "Query %s match=%d", qname, match);
 
     // Проксируем всегда
     int up = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1167,35 +1178,45 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
         if (match) {
             uint32_t ips[10];
             int n = extract_ips_from_response(buf, rlen, ips, 10);
-            
-            // Группируем IP по подсетям для оптимизации
-            uint32_t subnets[10];
-            int unique_subnets = 0;
-            
-            for (int i = 0; i < n; ++i) {
-                uint32_t subnet = get_subnet_24(ips[i]);
-                
-                // Проверяем, не обработали ли мы уже эту подсеть
-                int found = 0;
-                for (int j = 0; j < unique_subnets; j++) {
-                    if (subnets[j] == subnet) {
-                        found = 1;
-                        break;
+            syslog(LOG_DEBUG, "Extracted %d IPs for %s", n, qname);
+            if (n <= 0) {
+                syslog(LOG_DEBUG, "No IP addresses for %s, skipping route", qname);
+            } else {
+                // Группируем IP по подсетям для оптимизации
+                uint32_t subnets[10];
+                int unique_subnets = 0;
+
+                for (int i = 0; i < n; ++i) {
+                    uint32_t subnet = get_subnet_24(ips[i]);
+
+                    // Проверяем, не обработали ли мы уже эту подсеть
+                    int found = 0;
+                    for (int j = 0; j < unique_subnets; j++) {
+                        if (subnets[j] == subnet) {
+                            found = 1;
+                            break;
+                        }
+                    }
+
+                    if (!found) {
+                        subnets[unique_subnets++] = subnet;
                     }
                 }
-                
-                if (!found) {
-                    subnets[unique_subnets++] = subnet;
-                }
-            }
-            
-            // Обрабатываем уникальные подсети
-            for (int i = 0; i < unique_subnets; ++i) {
-                if (!is_ip_cached(subnets[i])) {
+
+                // Обрабатываем уникальные подсети
+                for (int i = 0; i < unique_subnets; ++i) {
+                    struct in_addr addr;
+                    addr.s_addr = subnets[i];
+                    if (is_ip_cached(subnets[i])) {
+                        syslog(LOG_DEBUG, "Subnet %s for %s cached, skipping route", inet_ntoa(addr), qname);
+                        continue;
+                    }
                     // Используем любой IP из этой подсети
                     for (int j = 0; j < n; ++j) {
                         if (get_subnet_24(ips[j]) == subnets[i]) {
-                            add_route_via_pfroute(ips[j], qname, gw->gateway);
+                            if (add_route_via_pfroute(ips[j], qname, gw->gateway) != 0) {
+                                syslog(LOG_DEBUG, "Failed to add route for %s via %s", qname, gw->gateway);
+                            }
                             break;
                         }
                     }
