@@ -661,6 +661,11 @@ void sighup_handler(evutil_socket_t fd, short what, void *arg) {
     load_blocklist();
 }
 
+void sigterm_handler(evutil_socket_t fd, short what, void *arg) {
+    syslog(LOG_INFO, "Termination signal received, shutting down");
+    event_base_loopbreak(evbase);
+}
+
 // Функция для получения подсети /24 из IP
 uint32_t get_subnet_24(uint32_t ip) {
     // Преобразуем из сетевого порядка в хостовый, применяем маску и возвращаем в сетевом порядке
@@ -890,6 +895,61 @@ void free_ip_cache() {
     free(ip_cache->buckets);
     free(ip_cache);
     ip_cache = NULL;
+}
+
+void delete_route_for_subnet(uint32_t subnet) {
+    int rtsock = socket(PF_ROUTE, SOCK_RAW, 0);
+    if (rtsock < 0) {
+        syslog(LOG_ERR, "PF_ROUTE socket failed: %s", strerror(errno));
+        return;
+    }
+
+    struct {
+        struct rt_msghdr hdr;
+        struct sockaddr_in dst;
+        struct sockaddr_in netmask;
+    } msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.rtm_msglen = sizeof(msg);
+    msg.hdr.rtm_version = RTM_VERSION;
+    msg.hdr.rtm_type = RTM_DELETE;
+    msg.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
+    msg.hdr.rtm_addrs = RTA_DST | RTA_NETMASK;
+    msg.hdr.rtm_pid = getpid();
+
+    msg.dst.sin_len = sizeof(struct sockaddr_in);
+    msg.dst.sin_family = AF_INET;
+    msg.dst.sin_addr.s_addr = subnet;
+
+    msg.netmask.sin_len = sizeof(struct sockaddr_in);
+    msg.netmask.sin_family = AF_INET;
+    msg.netmask.sin_addr.s_addr = htonl(0xFFFFFF00);
+
+    struct in_addr addr;
+    addr.s_addr = subnet;
+
+    if (write(rtsock, &msg, sizeof(msg)) < 0) {
+        syslog(LOG_WARNING, "Failed to delete route for %s/24: %s",
+               inet_ntoa(addr), strerror(errno));
+    } else {
+        syslog(LOG_INFO, "Route deleted for %s/24", inet_ntoa(addr));
+    }
+
+    close(rtsock);
+}
+
+void delete_all_routes() {
+    if (!ip_cache) return;
+
+    for (size_t i = 0; i < ip_cache->size; i++) {
+        struct cached_ip *entry = ip_cache->buckets[i];
+        while (entry) {
+            delete_route_for_subnet(entry->subnet);
+            entry = entry->next;
+        }
+    }
+    free_ip_cache();
 }
 
 void add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
@@ -1222,6 +1282,12 @@ int main() {
     struct event *sighup_ev = evsignal_new(evbase, SIGHUP, sighup_handler, NULL);
     event_add(sighup_ev, NULL);
 
+    struct event *sigterm_ev = evsignal_new(evbase, SIGTERM, sigterm_handler, NULL);
+    event_add(sigterm_ev, NULL);
+
+    struct event *sigint_ev = evsignal_new(evbase, SIGINT, sigterm_handler, NULL);
+    event_add(sigint_ev, NULL);
+
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -1238,5 +1304,15 @@ int main() {
 
     syslog(LOG_INFO, "dnsproxy started on %s:%d", cfg.listen_address, cfg.listen_port);
     event_base_dispatch(evbase);
+
+    delete_all_routes();
+
+    event_free(dns_event);
+    event_free(sighup_ev);
+    event_free(sigterm_ev);
+    event_free(sigint_ev);
+    event_base_free(evbase);
+    close(sockfd);
+    closelog();
     return 0;
 }
