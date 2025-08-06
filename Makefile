@@ -7,6 +7,9 @@ SRC = dnsproxy.c
 CONF = dnsproxy.conf
 RC_SCRIPT = dnsproxy.rc
 
+TEST_BIN = tests/extract_ips_test
+TEST_SRC = tests/extract_ips_test.c
+
 PREFIX = /usr/local
 SBIN_DIR = $(PREFIX)/sbin
 ETC_DIR = $(PREFIX)/etc
@@ -16,6 +19,12 @@ all: $(BIN)
 
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $(BIN) $(SRC) $(LDFLAGS)
+
+$(TEST_BIN): $(TEST_SRC)
+	$(CC) $(CFLAGS) -o $(TEST_BIN) $(TEST_SRC)
+
+test: $(TEST_BIN)
+	./$(TEST_BIN)
 
 install: $(BIN)
 	install -d -m 755 $(SBIN_DIR)
@@ -29,4 +38,4 @@ install: $(BIN)
 	install -m 755 $(RC_SCRIPT) $(RC_DIR)/dnsproxy
 
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) $(TEST_BIN)
