@@ -1089,6 +1089,8 @@ int extract_ips_from_response(char *packet, ssize_t len, uint32_t *ips, int max_
     if (len < 12) return 0;
     int qdcount = ntohs(*(uint16_t*)(packet + 4));
     int ancount = ntohs(*(uint16_t*)(packet + 6));
+    int nscount = ntohs(*(uint16_t*)(packet + 8));
+    int arcount = ntohs(*(uint16_t*)(packet + 10));
     int pos = 12;
 
     // skip question section
@@ -1108,6 +1110,26 @@ int extract_ips_from_response(char *packet, ssize_t len, uint32_t *ips, int max_
         }
         pos += 12 + rdlen;
     }
+
+    // skip authority section
+    for (int i = 0; i < nscount; i++) {
+        if (pos + 12 > len) break;
+        uint16_t rdlen = ntohs(*(uint16_t*)(packet + pos + 10));
+        pos += 12 + rdlen;
+    }
+
+    // process additional section
+    for (int i = 0; i < arcount && found < max_ips; i++) {
+        if (pos + 12 > len) break;
+        uint16_t type = ntohs(*(uint16_t*)(packet + pos + 2));
+        uint16_t rdlen = ntohs(*(uint16_t*)(packet + pos + 10));
+        if (type == 1 && rdlen == 4 && pos + 12 + 4 <= len) {
+            memcpy(&ips[found], packet + pos + 12, 4);
+            found++;
+        }
+        pos += 12 + rdlen;
+    }
+
     return found;
 }
 
