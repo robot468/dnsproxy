@@ -3,6 +3,14 @@ set -e
 OS=`uname -s`
 CFLAGS="-Wall -O2 -D_GNU_SOURCE"
 LDFLAGS="-levent -pthread"
+
+# Verify that libevent headers are available
+CC_CMD=${CC:-cc}
+if ! printf '#include <event2/event.h>\n' | "$CC_CMD" -E - >/dev/null 2>&1; then
+    echo "libevent headers not found. Please install libevent development files." >&2
+    exit 1
+fi
+
 if [ "$OS" = "Linux" ]; then
     : # defaults are fine
 else

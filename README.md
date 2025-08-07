@@ -1,6 +1,9 @@
 # dnsproxy
 
-Поддерживаются FreeBSD и Linux (нужен libevent). Перед сборкой запустите `./configure`, который сгенерирует подходящий Makefile.
+Поддерживаются FreeBSD и Linux. Перед сборкой убедитесь, что установлены заголовки
+и библиотеки [libevent](https://libevent.org/) (например, пакет `libevent-dev` в
+Debian/Ubuntu). Затем запустите `./configure`, который сгенерирует подходящий
+Makefile.
 
 Dns proxy for domain based routing
 
@@ -28,6 +31,6 @@ blocked_domains_file = /usr/local/etc/blocklist_other.txt
 ## remove_temp_routes.sh
 
 Скрипт `remove_temp_routes.sh` удаляет временные маршруты, у которых задано
-время истечения (expires). Использует `netstat` и `route` из базовой системы
-FreeBSD, требуются привилегии root.
+время истечения (expires). На Linux используется утилита `ip`, на FreeBSD —
+`netstat` и `route`. Для выполнения требуются привилегии root.
 
