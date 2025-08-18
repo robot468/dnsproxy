@@ -1,6 +1,6 @@
 # dnsproxy
 
-пока freebsd only
+Работает под FreeBSD и Linux
 
 Dns proxy for domain based routing
 
@@ -33,6 +33,7 @@ additional-секций DNS.
 Собрать и запустить встроенные тесты можно так:
 
 ```
+./configure
 make test
 ```
 
