@@ -1,0 +1,18 @@
+#!/bin/sh
+# Simple configure script to set build flags based on platform
+OS=$(uname -s)
+case "$OS" in
+    FreeBSD)
+        echo "CFLAGS += -DPLATFORM_FREEBSD -I/usr/local/include -I/usr/local/include/event2" > config.mk
+        echo "LDFLAGS += -L/usr/local/lib" >> config.mk
+        ;;
+    Linux)
+        echo "CFLAGS += -DPLATFORM_LINUX" > config.mk
+        echo "LDFLAGS +=" >> config.mk
+        ;;
+    *)
+        echo "Unsupported OS: $OS" >&2
+        exit 1
+        ;;
+ esac
+ echo "Configured for $OS. Edit config.mk to adjust paths if needed." 

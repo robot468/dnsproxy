@@ -1,6 +1,8 @@
 CC = cc
-CFLAGS = -Wall -O2 -D_GNU_SOURCE -I/usr/local/include -I/usr/local/include/event2
-LDFLAGS = -L/usr/local/lib -levent -pthread
+CFLAGS = -Wall -O2 -D_GNU_SOURCE
+LDFLAGS = -levent -pthread
+
+-include config.mk
 
 BIN = dnsproxy
 SRC = dnsproxy.c

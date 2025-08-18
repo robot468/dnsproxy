@@ -15,16 +15,24 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <net/if.h>
+#include <sys/uio.h>
+#include <event2/event.h>
+#include <sys/queue.h>
+
+#ifdef __linux__
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#elif defined(__FreeBSD__)
 #include <net/route.h>
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <netinet/ip.h>
-#include <netinet/in.h>
 #include <netinet/ip_var.h>
 #include <net/if_types.h>
-#include <sys/uio.h>
-#include <event2/event.h>
-#include <sys/queue.h>
+#else
+#error "Unsupported platform"
+#endif
 
 // Constants
 #define MAX_CACHED_IPS 65536
@@ -898,6 +906,142 @@ void free_ip_cache() {
     ip_cache = NULL;
 }
 
+#if defined(__linux__)
+
+static void parse_rtattr(struct rtattr **tb, int max, struct rtattr *rta, int len) {
+    while (RTA_OK(rta, len)) {
+        if (rta->rta_type <= max)
+            tb[rta->rta_type] = rta;
+        rta = RTA_NEXT(rta, len);
+    }
+}
+
+static int addattr_l(struct nlmsghdr *n, size_t maxlen, int type, const void *data, size_t alen) {
+    size_t len = RTA_LENGTH(alen);
+    size_t newlen = NLMSG_ALIGN(n->nlmsg_len) + len;
+    if (newlen > maxlen)
+        return -1;
+    struct rtattr *rta = (struct rtattr *)(((char *)n) + NLMSG_ALIGN(n->nlmsg_len));
+    rta->rta_type = type;
+    rta->rta_len = len;
+    if (alen)
+        memcpy(RTA_DATA(rta), data, alen);
+    n->nlmsg_len = newlen;
+    return 0;
+}
+
+int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
+    uint32_t subnet = get_subnet_24(ip);
+    if (is_ip_cached(subnet))
+        return 0;
+
+    int rtsock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (rtsock < 0) {
+        syslog(LOG_ERR, "NETLINK socket failed: %s", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_nl nladdr = { .nl_family = AF_NETLINK };
+    int result = 0;
+
+    // Check existing route
+    struct { struct nlmsghdr nh; struct rtmsg rt; char buf[256]; } req;
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.nh.nlmsg_type = RTM_GETROUTE;
+    req.nh.nlmsg_flags = NLM_F_REQUEST;
+    req.rt.rtm_family = AF_INET;
+    req.rt.rtm_dst_len = 24;
+    addattr_l(&req.nh, sizeof(req), RTA_DST, &subnet, sizeof(subnet));
+    if (sendto(rtsock, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&nladdr, sizeof(nladdr)) >= 0) {
+        char buf[4096];
+        int len = recv(rtsock, buf, sizeof(buf), 0);
+        if (len > 0) {
+            struct nlmsghdr *nh;
+            for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, len); nh = NLMSG_NEXT(nh, len)) {
+                if (nh->nlmsg_type == RTM_NEWROUTE) {
+                    struct rtmsg *rtm = NLMSG_DATA(nh);
+                    struct rtattr *tb[RTA_MAX + 1];
+                    memset(tb, 0, sizeof(tb));
+                    parse_rtattr(tb, RTA_MAX, RTM_RTA(rtm), RTM_PAYLOAD(nh));
+                    if (tb[RTA_GATEWAY]) {
+                        uint32_t gw = *(uint32_t *)RTA_DATA(tb[RTA_GATEWAY]);
+                        char gwbuf[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &gw, gwbuf, sizeof(gwbuf));
+                        struct in_addr addr; addr.s_addr = subnet;
+                        if (strcmp(gwbuf, gateway) == 0) {
+                            time_t now = time(NULL);
+                            time_t expire = now + cfg.route_expire;
+                            if (tb[RTA_METRICS]) {
+                                struct rtattr *mt[RTAX_MAX + 1];
+                                memset(mt, 0, sizeof(mt));
+                                parse_rtattr(mt, RTAX_MAX, RTA_DATA(tb[RTA_METRICS]), RTA_PAYLOAD(tb[RTA_METRICS]));
+                                if (mt[RTAX_EXPIRES])
+                                    expire = now + *(uint32_t *)RTA_DATA(mt[RTAX_EXPIRES]);
+                            }
+                            add_ip_cache_with_expire(subnet, expire);
+                            close(rtsock);
+                            return 0;
+                        }
+                        if (rtm->rtm_protocol == RTPROT_STATIC) {
+                            syslog(LOG_WARNING,
+                                   "Route for %s/24 (domain: %s) exists via different gateway: %s",
+                                   inet_ntoa(addr), domain, gwbuf);
+                            close(rtsock);
+                            return -1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add new route
+    struct { struct nlmsghdr nh; struct rtmsg rt; char buf[256]; } add;
+    memset(&add, 0, sizeof(add));
+    add.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    add.nh.nlmsg_type = RTM_NEWROUTE;
+    add.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
+    add.rt.rtm_family = AF_INET;
+    add.rt.rtm_table = RT_TABLE_MAIN;
+    add.rt.rtm_protocol = RTPROT_STATIC;
+    add.rt.rtm_scope = RT_SCOPE_UNIVERSE;
+    add.rt.rtm_type = RTN_UNICAST;
+    add.rt.rtm_dst_len = 24;
+    addattr_l(&add.nh, sizeof(add), RTA_DST, &subnet, sizeof(subnet));
+    struct in_addr gwaddr; inet_pton(AF_INET, gateway, &gwaddr);
+    addattr_l(&add.nh, sizeof(add), RTA_GATEWAY, &gwaddr, sizeof(gwaddr));
+
+    // Set expiration
+    struct rtattr *metrics = (struct rtattr *)(((char *)&add) + NLMSG_ALIGN(add.nh.nlmsg_len));
+    metrics->rta_type = RTA_METRICS;
+    metrics->rta_len = RTA_LENGTH(0);
+    struct rtattr *mt = (struct rtattr *)((char *)metrics + RTA_LENGTH(0));
+    uint32_t expire = cfg.route_expire;
+    mt->rta_type = RTAX_EXPIRES;
+    mt->rta_len = RTA_LENGTH(sizeof(expire));
+    memcpy(RTA_DATA(mt), &expire, sizeof(expire));
+    metrics->rta_len = RTA_LENGTH(RTA_LENGTH(sizeof(expire)));
+    add.nh.nlmsg_len = NLMSG_ALIGN(add.nh.nlmsg_len) + metrics->rta_len;
+
+    if (sendto(rtsock, &add, add.nh.nlmsg_len, 0, (struct sockaddr *)&nladdr, sizeof(nladdr)) < 0) {
+        struct in_addr addr; addr.s_addr = subnet;
+        syslog(LOG_WARNING, "Failed to add route for %s/24 (domain: %s): %s",
+               inet_ntoa(addr), domain, strerror(errno));
+        result = -1;
+    } else {
+        struct in_addr addr; addr.s_addr = subnet;
+        syslog(LOG_INFO, "Route added for %s/24 (domain: %s) via %s",
+               inet_ntoa(addr), domain, gateway);
+        add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire);
+    }
+
+    close(rtsock);
+    return result;
+}
+
+#elif defined(__FreeBSD__)
+
 int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
     uint32_t subnet = get_subnet_24(ip);
     int result = 0;
@@ -1000,7 +1144,7 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
                 close(rtsock);
                 return 0;
             }
-            
+
             if (rtm->rtm_flags & RTF_STATIC) {
                 // Существует статический маршрут через другой шлюз
                 syslog(LOG_WARNING, "Route for %s/24 (domain: %s) exists via different gateway: %s",
@@ -1013,7 +1157,7 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
 
 add_route:
     ;  // Пустой оператор после метки
-    
+
     // Добавление маршрута для подсети /24
     struct {
         struct rt_msghdr hdr;
@@ -1054,6 +1198,7 @@ add_route:
         result = -1;
     } else {
         // Ждем подтверждения добавления маршрута
+        ssize_t n;
         do {
             n = read(rtsock, buf, sizeof(buf));
             rtm = (struct rt_msghdr *)buf;
@@ -1077,6 +1222,8 @@ add_route:
     close(rtsock);
     return result;
 }
+
+#endif /* __linux__ / __FreeBSD__ */
 
 
 int parse_dns_query(char *packet, ssize_t len, char *qname) {
