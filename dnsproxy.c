@@ -580,10 +580,7 @@ void load_config() {
     setlogmask(LOG_UPTO(cfg.log_level));
 }
 
-// Функция загрузки блоклиста теперь обычная:
-void load_blocklist() {
-    syslog(LOG_INFO, "Loading blocklist");
-
+void free_blocklist() {
     for (int i = 0; i < cfg.gateway_count; i++) {
         if (cfg.gateways[i].domain_root) {
             free_domain_node(cfg.gateways[i].domain_root);
@@ -594,6 +591,13 @@ void load_blocklist() {
         free_string_pool(global_string_pool);
         global_string_pool = NULL;
     }
+}
+
+// Функция загрузки блоклиста теперь обычная:
+void load_blocklist() {
+    syslog(LOG_INFO, "Loading blocklist");
+
+    free_blocklist();
 
     int total_domains = 0;
     struct timeval start_time, current_time, last_progress_time;
@@ -671,6 +675,7 @@ int domain_matches(const char *query, struct gateway_config **match_gw) {
 // Обработчик SIGHUP
 void sighup_handler(evutil_socket_t fd, short what, void *arg) {
     syslog(LOG_INFO, "Reloading configuration and blocklist");
+    free_blocklist();
     load_config();
     load_blocklist();
 }
