@@ -580,10 +580,7 @@ void load_config() {
     setlogmask(LOG_UPTO(cfg.log_level));
 }
 
-// Функция загрузки блоклиста теперь обычная:
-void load_blocklist() {
-    syslog(LOG_INFO, "Loading blocklist");
-
+void free_blocklist() {
     for (int i = 0; i < cfg.gateway_count; i++) {
         if (cfg.gateways[i].domain_root) {
             free_domain_node(cfg.gateways[i].domain_root);
@@ -594,6 +591,10 @@ void load_blocklist() {
         free_string_pool(global_string_pool);
         global_string_pool = NULL;
     }
+}
+
+void load_blocklist() {
+    syslog(LOG_INFO, "Loading blocklist");
 
     int total_domains = 0;
     struct timeval start_time, current_time, last_progress_time;
@@ -671,6 +672,7 @@ int domain_matches(const char *query, struct gateway_config **match_gw) {
 // Обработчик SIGHUP
 void sighup_handler(evutil_socket_t fd, short what, void *arg) {
     syslog(LOG_INFO, "Reloading configuration and blocklist");
+    free_blocklist();
     load_config();
     load_blocklist();
 }
@@ -1311,8 +1313,11 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
     char buf[512];
     struct sockaddr_in cli;
     socklen_t slen = sizeof(cli);
+    int up = -1;
+
     ssize_t len = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&cli, &slen);
-    if (len <= 0) return;
+    if (len <= 0)
+        goto out;
 
     char qname[256] = {0};
     parse_dns_query(buf, len, qname);
@@ -1322,8 +1327,9 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
     syslog(LOG_DEBUG, "Query %s match=%d", qname, match);
 
     // Проксируем всегда
-    int up = socket(AF_INET, SOCK_DGRAM, 0);
-    if (up < 0) return;
+    up = socket(AF_INET, SOCK_DGRAM, 0);
+    if (up < 0)
+        goto out;
 
     struct sockaddr_in upstream;
     upstream.sin_family = AF_INET;
@@ -1389,7 +1395,9 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
         }
     }
 
-    close(up);
+out:
+    if (up >= 0)
+        close(up);
     cleanup_ip_cache();
 }
 
