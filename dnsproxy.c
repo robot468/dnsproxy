@@ -1313,11 +1313,8 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
     char buf[512];
     struct sockaddr_in cli;
     socklen_t slen = sizeof(cli);
-    int up = -1;
-
     ssize_t len = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&cli, &slen);
-    if (len <= 0)
-        goto out;
+    if (len <= 0) return;
 
     char qname[256] = {0};
     parse_dns_query(buf, len, qname);
@@ -1327,9 +1324,8 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
     syslog(LOG_DEBUG, "Query %s match=%d", qname, match);
 
     // Проксируем всегда
-    up = socket(AF_INET, SOCK_DGRAM, 0);
-    if (up < 0)
-        goto out;
+    int up = socket(AF_INET, SOCK_DGRAM, 0);
+    if (up < 0) return;
 
     struct sockaddr_in upstream;
     upstream.sin_family = AF_INET;
@@ -1395,9 +1391,7 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
         }
     }
 
-out:
-    if (up >= 0)
-        close(up);
+    close(up);
     cleanup_ip_cache();
 }
 
