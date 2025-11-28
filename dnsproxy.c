@@ -75,6 +75,8 @@ struct hash_entry {
 struct cached_ip {
     uint32_t subnet;
     time_t expiry;
+    int owned;            // Маршрут создан текущим процессом
+    char gateway[64];     // Шлюз для удаления маршрута
     struct cached_ip *next;
 };
 
@@ -113,6 +115,10 @@ struct string_pool *create_string_pool(size_t initial_capacity);
 uint32_t pool_add_string(struct string_pool *pool, const char *str);
 const char *pool_get_string(struct string_pool *pool, uint32_t offset);
 void free_string_pool(struct string_pool *pool);
+
+// Route management helpers
+int remove_route(uint32_t subnet, const char *gateway);
+void cleanup_owned_routes();
 
 // Global variables
 struct ip_cache *ip_cache = NULL;
@@ -522,6 +528,7 @@ void load_config() {
 
     cfg.gateway_count = 0;
     cfg.log_level = LOG_INFO;
+    cfg.route_expire = 86400; // 24h default TTL
     struct gateway_config *current_gw = NULL;
     
     char line[512];
@@ -680,6 +687,11 @@ void sighup_handler(evutil_socket_t fd, short what, void *arg) {
     load_blocklist();
 }
 
+void shutdown_handler(evutil_socket_t fd, short what, void *arg) {
+    syslog(LOG_INFO, "Received shutdown signal, cleaning up routes");
+    event_base_loopbreak(evbase);
+}
+
 // Функция для получения подсети /24 из IP
 uint32_t get_subnet_24(uint32_t ip) {
     // Преобразуем из сетевого порядка в хостовый, применяем маску и возвращаем в сетевом порядке
@@ -751,7 +763,7 @@ void resize_ip_cache(struct ip_cache *cache) {
     cache->size = new_size;
 }
 
-void add_ip_cache_with_expire(uint32_t subnet, time_t expire) {
+void add_ip_cache_with_expire(uint32_t subnet, time_t expire, const char *gateway, int owned) {
     // Создаем кэш если его нет
     if (!ip_cache) {
         ip_cache = create_ip_cache(INITIAL_IP_CACHE_SIZE);
@@ -761,6 +773,11 @@ void add_ip_cache_with_expire(uint32_t subnet, time_t expire) {
     struct cached_ip *entry = find_subnet(ip_cache, subnet);
     if (entry) {
         entry->expiry = expire;
+        if (gateway) {
+            strncpy(entry->gateway, gateway, sizeof(entry->gateway) - 1);
+            entry->gateway[sizeof(entry->gateway) - 1] = '\0';
+        }
+        entry->owned = entry->owned || owned;
         return;
     }
     // Проверяем необходимость ресайза
@@ -774,10 +791,25 @@ void add_ip_cache_with_expire(uint32_t subnet, time_t expire) {
     }
     entry->subnet = subnet;
     entry->expiry = expire;
+    entry->owned = owned;
+    entry->gateway[0] = '\0';
+    if (gateway) {
+        strncpy(entry->gateway, gateway, sizeof(entry->gateway) - 1);
+        entry->gateway[sizeof(entry->gateway) - 1] = '\0';
+    }
     size_t index = hash_subnet(subnet, ip_cache->size);
     entry->next = ip_cache->buckets[index];
     ip_cache->buckets[index] = entry;
     ip_cache->count++;
+}
+
+void refresh_ip_cache_entry(uint32_t subnet) {
+    if (!ip_cache) return;
+
+    struct cached_ip *entry = find_subnet(ip_cache, subnet);
+    if (entry) {
+        entry->expiry = time(NULL) + cfg.route_expire;
+    }
 }
 
 // Сжатие хэш-таблицы при малом количестве элементов
@@ -857,16 +889,19 @@ void free_domain_node(struct domain_node *node) {
 // Добавляем сжатие хэш-таблицы в cleanup_ip_cache
 void cleanup_ip_cache() {
     if (!ip_cache) return;
-    
+
     time_t now = time(NULL);
     size_t removed = 0;
-    
+
     for (size_t i = 0; i < ip_cache->size; i++) {
         struct cached_ip **pp = &ip_cache->buckets[i];
         struct cached_ip *entry = *pp;
         
         while (entry) {
             if (entry->expiry <= now) {
+                if (entry->owned) {
+                    remove_route(entry->subnet, entry->gateway);
+                }
                 *pp = entry->next;
                 free(entry);
                 ip_cache->count--;
@@ -883,6 +918,27 @@ void cleanup_ip_cache() {
         // Сжимаем кэш IP после удаления элементов
         shrink_ip_cache(ip_cache);
     }
+}
+
+void cleanup_owned_routes() {
+    if (!ip_cache) return;
+
+    for (size_t i = 0; i < ip_cache->size; i++) {
+        struct cached_ip **pp = &ip_cache->buckets[i];
+        while (*pp) {
+            struct cached_ip *entry = *pp;
+            if (entry->owned) {
+                remove_route(entry->subnet, entry->gateway);
+                *pp = entry->next;
+                free(entry);
+                ip_cache->count--;
+            } else {
+                pp = &entry->next;
+            }
+        }
+    }
+
+    shrink_ip_cache(ip_cache);
 }
 
 int is_ip_cached(uint32_t subnet) {
@@ -935,10 +991,54 @@ static int addattr_l(struct nlmsghdr *n, size_t maxlen, int type, const void *da
     return 0;
 }
 
+int remove_route(uint32_t subnet, const char *gateway) {
+    struct in_addr gwaddr = {0};
+    if (gateway && *gateway) {
+        inet_pton(AF_INET, gateway, &gwaddr);
+    }
+
+    int rtsock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (rtsock < 0) {
+        syslog(LOG_ERR, "NETLINK socket failed for delete: %s", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_nl nladdr = { .nl_family = AF_NETLINK };
+    struct { struct nlmsghdr nh; struct rtmsg rt; char buf[256]; } req;
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.nh.nlmsg_type = RTM_DELROUTE;
+    req.nh.nlmsg_flags = NLM_F_REQUEST;
+    req.rt.rtm_family = AF_INET;
+    req.rt.rtm_table = RT_TABLE_MAIN;
+    req.rt.rtm_scope = RT_SCOPE_UNIVERSE;
+    req.rt.rtm_protocol = RTPROT_STATIC;
+    req.rt.rtm_type = RTN_UNICAST;
+    req.rt.rtm_dst_len = 24;
+
+    addattr_l(&req.nh, sizeof(req), RTA_DST, &subnet, sizeof(subnet));
+    if (gateway && *gateway) {
+        addattr_l(&req.nh, sizeof(req), RTA_GATEWAY, &gwaddr, sizeof(gwaddr));
+    }
+
+    int result = 0;
+    if (sendto(rtsock, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&nladdr, sizeof(nladdr)) < 0) {
+        struct in_addr addr; addr.s_addr = subnet;
+        syslog(LOG_WARNING, "Failed to delete route for %s/24 via %s: %s",
+               inet_ntoa(addr), gateway ? gateway : "<none>", strerror(errno));
+        result = -1;
+    }
+
+    close(rtsock);
+    return result;
+}
+
 int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
     uint32_t subnet = get_subnet_24(ip);
-    if (is_ip_cached(subnet))
+    if (is_ip_cached(subnet)) {
+        refresh_ip_cache_entry(subnet);
         return 0;
+    }
 
     int rtsock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     if (rtsock < 0) {
@@ -975,26 +1075,20 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
                         inet_ntop(AF_INET, &gw, gwbuf, sizeof(gwbuf));
                         struct in_addr addr; addr.s_addr = subnet;
                         if (strcmp(gwbuf, gateway) == 0) {
-                            time_t now = time(NULL);
-                            time_t expire = now + cfg.route_expire;
-                            if (tb[RTA_METRICS]) {
-                                struct rtattr *mt[RTAX_MAX + 1];
-                                memset(mt, 0, sizeof(mt));
-                                parse_rtattr(mt, RTAX_MAX, RTA_DATA(tb[RTA_METRICS]), RTA_PAYLOAD(tb[RTA_METRICS]));
-                                if (mt[RTAX_EXPIRES])
-                                    expire = now + *(uint32_t *)RTA_DATA(mt[RTAX_EXPIRES]);
-                            }
-                            add_ip_cache_with_expire(subnet, expire);
+                            syslog(LOG_INFO,
+                                   "Route for %s/24 (domain: %s) already exists via %s, adopting it",
+                                   inet_ntoa(addr), domain, gwbuf);
+                            add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gateway, 1);
                             close(rtsock);
                             return 0;
                         }
-                        if (rtm->rtm_protocol == RTPROT_STATIC) {
-                            syslog(LOG_WARNING,
-                                   "Route for %s/24 (domain: %s) exists via different gateway: %s",
-                                   inet_ntoa(addr), domain, gwbuf);
-                            close(rtsock);
-                            return -1;
-                        }
+
+                        syslog(LOG_INFO,
+                               "Route for %s/24 (domain: %s) exists via different gateway: %s, leaving untouched",
+                               inet_ntoa(addr), domain, gwbuf);
+                        add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gwbuf, 0);
+                        close(rtsock);
+                        return -1;
                     }
                 }
             }
@@ -1017,18 +1111,6 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
     struct in_addr gwaddr; inet_pton(AF_INET, gateway, &gwaddr);
     addattr_l(&add.nh, sizeof(add), RTA_GATEWAY, &gwaddr, sizeof(gwaddr));
 
-    // Set expiration
-    struct rtattr *metrics = (struct rtattr *)(((char *)&add) + NLMSG_ALIGN(add.nh.nlmsg_len));
-    metrics->rta_type = RTA_METRICS;
-    metrics->rta_len = RTA_LENGTH(0);
-    struct rtattr *mt = (struct rtattr *)((char *)metrics + RTA_LENGTH(0));
-    uint32_t expire = cfg.route_expire;
-    mt->rta_type = RTAX_EXPIRES;
-    mt->rta_len = RTA_LENGTH(sizeof(expire));
-    memcpy(RTA_DATA(mt), &expire, sizeof(expire));
-    metrics->rta_len = RTA_LENGTH(RTA_LENGTH(sizeof(expire)));
-    add.nh.nlmsg_len = NLMSG_ALIGN(add.nh.nlmsg_len) + metrics->rta_len;
-
     if (sendto(rtsock, &add, add.nh.nlmsg_len, 0, (struct sockaddr *)&nladdr, sizeof(nladdr)) < 0) {
         struct in_addr addr; addr.s_addr = subnet;
         syslog(LOG_WARNING, "Failed to add route for %s/24 (domain: %s): %s",
@@ -1038,7 +1120,7 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
         struct in_addr addr; addr.s_addr = subnet;
         syslog(LOG_INFO, "Route added for %s/24 (domain: %s) via %s",
                inet_ntoa(addr), domain, gateway);
-        add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire);
+        add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gateway, 1);
     }
 
     close(rtsock);
@@ -1047,12 +1129,56 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
 
 #elif defined(__FreeBSD__)
 
+int remove_route(uint32_t subnet, const char *gateway) {
+    int rtsock = socket(PF_ROUTE, SOCK_RAW, 0);
+    if (rtsock < 0) {
+        syslog(LOG_ERR, "PF_ROUTE socket failed for delete: %s", strerror(errno));
+        return -1;
+    }
+
+    struct { struct rt_msghdr hdr; struct sockaddr_in dst; struct sockaddr_in gw; struct sockaddr_in netmask; } msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.rtm_msglen = sizeof(msg);
+    msg.hdr.rtm_version = RTM_VERSION;
+    msg.hdr.rtm_type = RTM_DELETE;
+    msg.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
+    msg.hdr.rtm_addrs = RTA_DST | RTA_NETMASK;
+    msg.hdr.rtm_pid = getpid();
+
+    msg.dst.sin_len = sizeof(struct sockaddr_in);
+    msg.dst.sin_family = AF_INET;
+    msg.dst.sin_addr.s_addr = subnet;
+
+    msg.netmask.sin_len = sizeof(struct sockaddr_in);
+    msg.netmask.sin_family = AF_INET;
+    msg.netmask.sin_addr.s_addr = htonl(0xFFFFFF00);
+
+    if (gateway && *gateway) {
+        msg.hdr.rtm_addrs |= RTA_GATEWAY;
+        msg.gw.sin_len = sizeof(struct sockaddr_in);
+        msg.gw.sin_family = AF_INET;
+        inet_pton(AF_INET, gateway, &msg.gw.sin_addr);
+    }
+
+    int result = 0;
+    if (write(rtsock, &msg, sizeof(msg)) < 0) {
+        struct in_addr addr; addr.s_addr = subnet;
+        syslog(LOG_WARNING, "Failed to delete route for %s/24 via %s: %s",
+               inet_ntoa(addr), gateway ? gateway : "<none>", strerror(errno));
+        result = -1;
+    }
+
+    close(rtsock);
+    return result;
+}
+
 int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) {
     uint32_t subnet = get_subnet_24(ip);
     int result = 0;
 
     // Проверяем кэш перед любыми операциями с сокетом
     if (is_ip_cached(subnet)) {
+        refresh_ip_cache_entry(subnet);
         return 0;
     }
 
@@ -1138,25 +1264,19 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
 
             if (strcmp(gwbuf, gateway) == 0) {
                 // Маршрут уже существует через наш шлюз
-                syslog(LOG_DEBUG, "Route for %s/24 (domain: %s) already exists via our gateway",
-                       inet_ntoa(addr), domain);
-                time_t now = time(NULL);
-                time_t expire = now + cfg.route_expire; // Use configured expiration time
-                if (rtm->rtm_rmx.rmx_expire > 0) {
-                    expire = rtm->rtm_rmx.rmx_expire;
-                }
-                add_ip_cache_with_expire(subnet, expire);
+                syslog(LOG_INFO, "Route for %s/24 (domain: %s) already exists via %s, adopting it",
+                       inet_ntoa(addr), domain, gwbuf);
+                add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gateway, 1);
                 close(rtsock);
                 return 0;
             }
 
-            if (rtm->rtm_flags & RTF_STATIC) {
-                // Существует статический маршрут через другой шлюз
-                syslog(LOG_WARNING, "Route for %s/24 (domain: %s) exists via different gateway: %s",
-                       inet_ntoa(addr), domain, gwbuf);
-                close(rtsock);
-                return -1;
-            }
+            // Существует маршрут через другой шлюз
+            syslog(LOG_INFO, "Route for %s/24 (domain: %s) exists via different gateway: %s, leaving untouched",
+                   inet_ntoa(addr), domain, gwbuf);
+            add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gwbuf, 0);
+            close(rtsock);
+            return -1;
         }
     }
 
@@ -1175,17 +1295,10 @@ add_route:
     msg.hdr.rtm_msglen = sizeof(msg);
     msg.hdr.rtm_version = RTM_VERSION;
     msg.hdr.rtm_type = RTM_ADD;
-    // RTF_STATIC маршруты игнорируют rmx_expire начиная с FreeBSD 14.3,
-    // из-за чего срок действия не устанавливается. Используем только
-    // необходимые флаги, чтобы ядро применило истечение.
-    msg.hdr.rtm_flags = RTF_UP | RTF_GATEWAY;  // Убрали RTF_PROTO1 и RTF_STATIC
+    msg.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
     msg.hdr.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
     msg.hdr.rtm_pid = getpid();
     msg.hdr.rtm_seq = seq + 1;  // Увеличиваем seq для нового сообщения
-    time_t now = time(NULL);
-    msg.hdr.rtm_inits = RTV_EXPIRE;
-    msg.hdr.rtm_rmx.rmx_expire = (u_long)(now + cfg.route_expire);
-    msg.hdr.rtm_rmx.rmx_locks = RTV_EXPIRE;  // Зафиксировать срок действия, чтобы ядро его не сбрасывало
 
     msg.dst.sin_len = sizeof(struct sockaddr_in);
     msg.dst.sin_family = AF_INET;
@@ -1217,11 +1330,7 @@ add_route:
         if (n > 0 && rtm->rtm_errno == 0) {
             syslog(LOG_INFO, "Route added for %s/24 (domain: %s) via %s",
                    inet_ntoa(addr), domain, gateway);
-            time_t expire = now + cfg.route_expire;
-            if (rtm->rtm_rmx.rmx_expire > 0) {
-                expire = rtm->rtm_rmx.rmx_expire;
-            }
-            add_ip_cache_with_expire(subnet, expire);
+            add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gateway, 1);
         } else {
             syslog(LOG_WARNING, "Route add confirmation failed for %s/24 (domain: %s): %s",
                    inet_ntoa(addr), domain, rtm->rtm_errno ? strerror(rtm->rtm_errno) : "No response");
@@ -1378,16 +1487,17 @@ void dns_read_cb(evutil_socket_t fd, short events, void *arg) {
                 }
 
                 // Обрабатываем уникальные подсети
-                for (int i = 0; i < unique_subnets; ++i) {
-                    struct in_addr addr;
-                    addr.s_addr = subnets[i];
-                    if (is_ip_cached(subnets[i])) {
-                        syslog(LOG_DEBUG, "Subnet %s for %s cached, skipping route", inet_ntoa(addr), qname);
-                        continue;
-                    }
-                    // Используем любой IP из этой подсети
-                    for (int j = 0; j < n; ++j) {
-                        if (get_subnet_24(ips[j]) == subnets[i]) {
+                    for (int i = 0; i < unique_subnets; ++i) {
+                        struct in_addr addr;
+                        addr.s_addr = subnets[i];
+                        if (is_ip_cached(subnets[i])) {
+                            refresh_ip_cache_entry(subnets[i]);
+                            syslog(LOG_DEBUG, "Subnet %s for %s cached, refreshed TTL", inet_ntoa(addr), qname);
+                            continue;
+                        }
+                        // Используем любой IP из этой подсети
+                        for (int j = 0; j < n; ++j) {
+                            if (get_subnet_24(ips[j]) == subnets[i]) {
                             if (add_route_via_pfroute(ips[j], qname, gw->gateway) != 0) {
                                 syslog(LOG_DEBUG, "Failed to add route for %s via %s", qname, gw->gateway);
                             }
@@ -1416,6 +1526,10 @@ int main() {
 
     struct event *sighup_ev = evsignal_new(evbase, SIGHUP, sighup_handler, NULL);
     event_add(sighup_ev, NULL);
+    struct event *sigint_ev = evsignal_new(evbase, SIGINT, shutdown_handler, NULL);
+    event_add(sigint_ev, NULL);
+    struct event *sigterm_ev = evsignal_new(evbase, SIGTERM, shutdown_handler, NULL);
+    event_add(sigterm_ev, NULL);
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;
@@ -1433,5 +1547,15 @@ int main() {
 
     syslog(LOG_INFO, "dnsproxy started on %s:%d", cfg.listen_address, cfg.listen_port);
     event_base_dispatch(evbase);
+    syslog(LOG_INFO, "dnsproxy stopping, removing managed routes");
+    cleanup_owned_routes();
+    free_ip_cache();
+    free_blocklist();
+    if (dns_event) event_free(dns_event);
+    if (sighup_ev) event_free(sighup_ev);
+    if (sigint_ev) event_free(sigint_ev);
+    if (sigterm_ev) event_free(sigterm_ev);
+    if (evbase) event_base_free(evbase);
+    close(sockfd);
     return 0;
 }
