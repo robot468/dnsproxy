@@ -1182,8 +1182,10 @@ add_route:
     msg.hdr.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
     msg.hdr.rtm_pid = getpid();
     msg.hdr.rtm_seq = seq + 1;  // Увеличиваем seq для нового сообщения
+    time_t now = time(NULL);
     msg.hdr.rtm_inits = RTV_EXPIRE;
-    msg.hdr.rtm_rmx.rmx_expire = time(NULL) + cfg.route_expire;
+    msg.hdr.rtm_rmx.rmx_expire = (u_long)(now + cfg.route_expire);
+    msg.hdr.rtm_rmx.rmx_locks = RTV_EXPIRE;  // Зафиксировать срок действия, чтобы ядро его не сбрасывало
 
     msg.dst.sin_len = sizeof(struct sockaddr_in);
     msg.dst.sin_family = AF_INET;
@@ -1215,7 +1217,7 @@ add_route:
         if (n > 0 && rtm->rtm_errno == 0) {
             syslog(LOG_INFO, "Route added for %s/24 (domain: %s) via %s",
                    inet_ntoa(addr), domain, gateway);
-            time_t expire = time(NULL) + cfg.route_expire;
+            time_t expire = now + cfg.route_expire;
             if (rtm->rtm_rmx.rmx_expire > 0) {
                 expire = rtm->rtm_rmx.rmx_expire;
             }
