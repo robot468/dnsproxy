@@ -1175,7 +1175,10 @@ add_route:
     msg.hdr.rtm_msglen = sizeof(msg);
     msg.hdr.rtm_version = RTM_VERSION;
     msg.hdr.rtm_type = RTM_ADD;
-    msg.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;  // Убрали RTF_PROTO1
+    // RTF_STATIC маршруты игнорируют rmx_expire начиная с FreeBSD 14.3,
+    // из-за чего срок действия не устанавливается. Используем только
+    // необходимые флаги, чтобы ядро применило истечение.
+    msg.hdr.rtm_flags = RTF_UP | RTF_GATEWAY;  // Убрали RTF_PROTO1 и RTF_STATIC
     msg.hdr.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
     msg.hdr.rtm_pid = getpid();
     msg.hdr.rtm_seq = seq + 1;  // Увеличиваем seq для нового сообщения
