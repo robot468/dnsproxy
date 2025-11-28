@@ -1075,6 +1075,8 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
                         inet_ntop(AF_INET, &gw, gwbuf, sizeof(gwbuf));
                         struct in_addr addr; addr.s_addr = subnet;
                         if (strcmp(gwbuf, gateway) == 0) {
+                            syslog(LOG_INFO,
+                                   "Route for %s/24 (domain: %s) already exists via %s, adopting it",
                             add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gateway, 0);
                             close(rtsock);
                             return 0;
@@ -1083,9 +1085,17 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
                             syslog(LOG_WARNING,
                                    "Route for %s/24 (domain: %s) exists via different gateway: %s",
                                    inet_ntoa(addr), domain, gwbuf);
+                            add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gateway, 1);
                             close(rtsock);
-                            return -1;
+                            return 0;
                         }
+
+                        syslog(LOG_INFO,
+                               "Route for %s/24 (domain: %s) exists via different gateway: %s, leaving untouched",
+                               inet_ntoa(addr), domain, gwbuf);
+                        add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gwbuf, 0);
+                        close(rtsock);
+                        return -1;
                     }
                 }
             }
@@ -1261,20 +1271,19 @@ int add_route_via_pfroute(uint32_t ip, const char *domain, const char *gateway) 
 
             if (strcmp(gwbuf, gateway) == 0) {
                 // Маршрут уже существует через наш шлюз
-                syslog(LOG_DEBUG, "Route for %s/24 (domain: %s) already exists via our gateway",
-                       inet_ntoa(addr), domain);
-                add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gateway, 0);
+                syslog(LOG_INFO, "Route for %s/24 (domain: %s) already exists via %s, adopting it",
+                       inet_ntoa(addr), domain, gwbuf);
+                add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gateway, 1);
                 close(rtsock);
                 return 0;
             }
 
-            if (rtm->rtm_flags & RTF_STATIC) {
-                // Существует статический маршрут через другой шлюз
-                syslog(LOG_WARNING, "Route for %s/24 (domain: %s) exists via different gateway: %s",
-                       inet_ntoa(addr), domain, gwbuf);
-                close(rtsock);
-                return -1;
-            }
+            // Существует маршрут через другой шлюз
+            syslog(LOG_INFO, "Route for %s/24 (domain: %s) exists via different gateway: %s, leaving untouched",
+                   inet_ntoa(addr), domain, gwbuf);
+            add_ip_cache_with_expire(subnet, time(NULL) + cfg.route_expire, gwbuf, 0);
+            close(rtsock);
+            return -1;
         }
     }
 
