@@ -1022,11 +1022,15 @@ int remove_route(uint32_t subnet, const char *gateway) {
     }
 
     int result = 0;
+    struct in_addr addr; addr.s_addr = subnet;
+
     if (sendto(rtsock, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&nladdr, sizeof(nladdr)) < 0) {
-        struct in_addr addr; addr.s_addr = subnet;
         syslog(LOG_WARNING, "Failed to delete route for %s/24 via %s: %s",
                inet_ntoa(addr), gateway ? gateway : "<none>", strerror(errno));
         result = -1;
+    } else {
+        syslog(LOG_INFO, "Deleted route for %s/24 via %s",
+               inet_ntoa(addr), gateway ? gateway : "<none>");
     }
 
     close(rtsock);
@@ -1168,11 +1172,15 @@ int remove_route(uint32_t subnet, const char *gateway) {
     }
 
     int result = 0;
+    struct in_addr addr; addr.s_addr = subnet;
+
     if (write(rtsock, &msg, sizeof(msg)) < 0) {
-        struct in_addr addr; addr.s_addr = subnet;
         syslog(LOG_WARNING, "Failed to delete route for %s/24 via %s: %s",
                inet_ntoa(addr), gateway ? gateway : "<none>", strerror(errno));
         result = -1;
+    } else {
+        syslog(LOG_INFO, "Deleted route for %s/24 via %s",
+               inet_ntoa(addr), gateway ? gateway : "<none>");
     }
 
     close(rtsock);
